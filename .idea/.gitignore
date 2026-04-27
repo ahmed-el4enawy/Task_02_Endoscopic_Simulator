@@ -1,8 +1,32 @@
 # Default ignored files
 /shelf/
 /workspace.xml
+
 # Editor-based HTTP Client requests
 /httpRequests/
+
 # Datasource local storage ignored files
 /dataSources/
 /dataSources.local.xml
+
+# --- NEW ADDITIONS ---
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments (Critical)
+.venv/
+venv/
+env/
+
+# Application Output (Prevents committing your test captures)
+capture_*.png
+endoscopy_capture_*.png
+
+# OS / IDE Files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
