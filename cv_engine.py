@@ -2,12 +2,13 @@
 cv_engine.py
 Advanced Computer Vision engine for the Endoscopic Simulator.
 Implements Fisheye distortion, NBI simulation, Parametric Bilateral Denoising,
-CLAHE, and custom Sobel edge overlays.
+CLAHE, custom Sobel edge overlays, and an FPS Telemetry HUD.
 """
 
 import cv2
 import numpy as np
 import os
+import time
 
 class EndoscopicEngine:
     def __init__(self, image_path=None):
@@ -18,6 +19,7 @@ class EndoscopicEngine:
         self._vignette_mask = None
         self._map_x = None
         self._map_y = None
+        self._last_time = time.time()
 
         # Parametric Hardware States
         self.illumination_intensity = 1.0
@@ -26,10 +28,10 @@ class EndoscopicEngine:
         self.pan_y = 0
 
         # Parametric Processing States
-        self.denoise_strength = 0          # 0 to 150
-        self.clahe_limit = 0.0             # 0.0 to 5.0
-        self.texture_opacity = 0.0         # 0.0 to 1.0
-        self.anomaly_min_area = 5000       # 5000 down to 100
+        self.denoise_strength = 0
+        self.clahe_limit = 0.0
+        self.texture_opacity = 0.0
+        self.anomaly_min_area = 5000
 
         # Toggles
         self.enable_nbi = False
@@ -38,6 +40,22 @@ class EndoscopicEngine:
         self.enable_hud = True
 
         self.load_image(image_path)
+
+    def reset_parameters(self):
+        """Snaps all optical physics and DSP parameters back to baseline."""
+        self.illumination_intensity = 1.0
+        self.zoom_level = 1.0
+        self.pan_x = 0
+        self.pan_y = 0
+
+        self.denoise_strength = 0
+        self.clahe_limit = 0.0
+        self.texture_opacity = 0.0
+        self.anomaly_min_area = 5000
+
+        self.enable_nbi = False
+        self.enable_fisheye = False
+        self.enable_pip = False
 
     def load_image(self, filepath):
         """Loads source data and pre-calculates physics matrices."""
@@ -63,7 +81,6 @@ class EndoscopicEngine:
         x, y = np.meshgrid(X, Y)
         radius = np.sqrt(x**2 + y**2)
 
-        # Gaussian falloff
         mask = np.exp(-(radius**2) / 0.8)
         self._vignette_mask = np.stack([mask]*3, axis=-1)
 
@@ -71,19 +88,16 @@ class EndoscopicEngine:
         """Pre-calculates pixel maps for optical Barrel Distortion."""
         x, y = np.meshgrid(np.arange(self.w), np.arange(self.h))
 
-        # Normalize to center [-1, 1]
         x_c = 2.0 * x / self.w - 1.0
         y_c = 2.0 * y / self.h - 1.0
         r = np.sqrt(x_c**2 + y_c**2)
-        r[r == 0] = 1 # Prevent division by zero
+        r[r == 0] = 1
 
-        # Distortion physics (theta)
         theta = r + 0.15 * r**3
 
         x_distorted = x_c * (theta / r)
         y_distorted = y_c * (theta / r)
 
-        # Denormalize
         self._map_x = ((x_distorted + 1.0) * self.w / 2.0).astype(np.float32)
         self._map_y = ((y_distorted + 1.0) * self.h / 2.0).astype(np.float32)
 
@@ -92,22 +106,16 @@ class EndoscopicEngine:
         raw_frame = self.base_image.copy()
         frame = raw_frame.copy()
 
-        # 1. Physics: NBI Optical Filter
         if self.enable_nbi:
             frame = self._apply_nbi(frame)
 
-        # 2. Physics: Fisheye Lens Distortion
         if self.enable_fisheye:
             frame = cv2.remap(frame, self._map_x, self._map_y, cv2.INTER_LINEAR)
 
-        # 3. Hardware: Navigation & Illumination
         frame = self._apply_navigation(frame)
         frame = self._apply_illumination(frame)
-
-        # 4. DSP: Parametric Signal Processing
         frame = self._apply_dsp(frame)
 
-        # 5. Overlays: PiP and HUD
         if self.enable_pip:
             frame = self._apply_pip(frame, raw_frame)
 
@@ -119,9 +127,7 @@ class EndoscopicEngine:
     def _apply_nbi(self, frame):
         """Simulates Narrow Band Imaging (415nm & 540nm wavelengths)."""
         b, g, r = cv2.split(frame)
-        # Red light penetrates deep and obscures surface vessels, so it is filtered out
         r_new = np.zeros_like(r)
-        # Enhance Green and Blue to highlight capillaries
         g_new = cv2.addWeighted(g, 1.2, b, 0.2, 0)
         b_new = cv2.addWeighted(b, 1.2, g, 0.2, 0)
         return cv2.merge((b_new, g_new, r_new))
@@ -145,12 +151,10 @@ class EndoscopicEngine:
         return np.clip(frame_float, 0, 255).astype(np.uint8)
 
     def _apply_dsp(self, frame):
-        # Bilateral Denoising
         if self.denoise_strength > 0:
             sigma = self.denoise_strength
             frame = cv2.bilateralFilter(frame, d=9, sigmaColor=sigma, sigmaSpace=sigma)
 
-        # Contrast Enhancement (CLAHE)
         if self.clahe_limit > 0.1:
             lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
             l, a, b = cv2.split(lab)
@@ -158,9 +162,9 @@ class EndoscopicEngine:
             cl = clahe.apply(l)
             frame = cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
 
-        # Sobel Texture Extraction
         if self.texture_opacity > 0.05:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            # Explicit from-scratch Sobel matrices
             Kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
             Ky = np.array([[-1, -2, -1], [ 0,  0,  0], [ 1,  2,  1]], dtype=np.float32)
 
@@ -168,12 +172,10 @@ class EndoscopicEngine:
             Gy = cv2.filter2D(gray, cv2.CV_32F, Ky)
             magnitude = cv2.normalize(cv2.magnitude(Gx, Gy), None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
 
-            # Blend the edge map over the original color frame
             edges_colored = cv2.cvtColor(magnitude, cv2.COLOR_GRAY2BGR)
             frame = cv2.addWeighted(frame, 1.0 - self.texture_opacity, edges_colored, self.texture_opacity, 0)
 
-        # Smart Anomaly Detection
-        if self.anomaly_min_area < 4900: # Only run if slider is actively lowered
+        if self.anomaly_min_area < 4900:
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             mask = cv2.bitwise_or(cv2.inRange(hsv, np.array([0, 120, 70]), np.array([10, 255, 255])),
                                   cv2.inRange(hsv, np.array([170, 120, 70]), np.array([180, 255, 255])))
@@ -189,11 +191,8 @@ class EndoscopicEngine:
         return frame
 
     def _apply_pip(self, frame, raw_frame):
-        """Renders the raw hardware feed in the bottom right corner."""
         pip_h, pip_w = int(self.h * 0.25), int(self.w * 0.25)
         pip_resized = cv2.resize(raw_frame, (pip_w, pip_h))
-
-        # Add white border
         cv2.rectangle(pip_resized, (0,0), (pip_w-1, pip_h-1), (255,255,255), 2)
 
         margin = 20
@@ -201,12 +200,19 @@ class EndoscopicEngine:
         return frame
 
     def _draw_hud(self, frame):
+        current_time = time.time()
+        fps = 1.0 / (current_time - self._last_time + 1e-6)
+        self._last_time = current_time
+
         cx, cy = self.w // 2, self.h // 2
         cv2.line(frame, (cx - 20, cy), (cx + 20, cy), (0, 255, 0), 1)
         cv2.line(frame, (cx, cy - 20), (cx, cy + 20), (0, 255, 0), 1)
+        cv2.circle(frame, (cx, cy), 15, (0, 255, 0), 1)
 
-        cv2.putText(frame, "REC", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-        cv2.circle(frame, (100, 42), 8, (0, 0, 255), -1)
-        cv2.putText(frame, f"ZOOM: {self.zoom_level:.1f}x", (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(frame, f"LIGHT: {int(self.illumination_intensity * 100)}%", (30, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, f"FPS: {int(fps)}", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, "REC", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        cv2.circle(frame, (100, 72), 8, (0, 0, 255), -1)
+
+        cv2.putText(frame, f"ZOOM: {self.zoom_level:.1f}x", (30, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, f"LIGHT: {int(self.illumination_intensity * 100)}%", (30, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         return frame
